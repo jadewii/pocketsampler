@@ -564,11 +564,11 @@ class InstantAudioEngine: NSObject, ObservableObject {
         return duration
     }
 
-    func playRecording(padNumber: Int) -> TimeInterval? {
+    func playRecording(padNumber: Int, trimStart: Float = 0.0, trimEnd: Float = 1.0) -> TimeInterval? {
         // Check if sample is in bank
         if let sampleData = sampleBank[padNumber] {
             // FAST PATH: Play from memory
-            return playFromSampleBank(sampleData: sampleData, padNumber: padNumber)
+            return playFromSampleBank(sampleData: sampleData, padNumber: padNumber, trimStart: trimStart, trimEnd: trimEnd)
         }
 
         // SLOW PATH: Sample not in bank yet (old recording or not processed)
@@ -603,7 +603,7 @@ class InstantAudioEngine: NSObject, ObservableObject {
             print("✅ Loaded pad \(padNumber) into sample bank")
 
             // Now play it
-            return playFromSampleBank(sampleData: sampleData, padNumber: padNumber)
+            return playFromSampleBank(sampleData: sampleData, padNumber: padNumber, trimStart: trimStart, trimEnd: trimEnd)
 
         } catch {
             print("❌ Failed to load pad \(padNumber): \(error)")
@@ -611,12 +611,31 @@ class InstantAudioEngine: NSObject, ObservableObject {
         }
     }
 
-    private func playFromSampleBank(sampleData: SampleData, padNumber: Int) -> TimeInterval? {
+    func playFromSampleBank(sampleData: SampleData, padNumber: Int, trimStart: Float = 0.0, trimEnd: Float = 1.0) -> TimeInterval? {
         // Safety check: make sure engine is running BEFORE any voice operations
         guard engine.isRunning else {
             print("❌ playFromSampleBank: Engine not running, cannot play pad \(padNumber)")
             print("   Check console for engine startup errors")
             return nil
+        }
+
+        // Apply trim markers to buffer
+        let bufferToPlay: AVAudioPCMBuffer
+        let actualDuration: TimeInterval
+
+        if trimStart > 0.0 || trimEnd < 1.0 {
+            // Need to trim the buffer
+            guard let trimmedBuffer = applyTrimToBuffer(sampleData.buffer, trimStart: trimStart, trimEnd: trimEnd) else {
+                print("❌ Failed to apply trim")
+                return nil
+            }
+            bufferToPlay = trimmedBuffer
+            actualDuration = Double(trimmedBuffer.frameLength) / trimmedBuffer.format.sampleRate
+            print("✂️ Playing trimmed: \(trimStart) to \(trimEnd) - Duration: \(actualDuration)s")
+        } else {
+            // Play full buffer
+            bufferToPlay = sampleData.buffer
+            actualDuration = Double(sampleData.buffer.frameLength) / sampleData.buffer.format.sampleRate
         }
 
         // Voice stealing: grab next voice from pool (round-robin)
@@ -630,15 +649,41 @@ class InstantAudioEngine: NSObject, ObservableObject {
         voice.pitchNode.pitch = 0
 
         // Schedule buffer (buffer already in memory)
-        voice.playerNode.scheduleBuffer(sampleData.buffer, at: nil, options: [], completionHandler: nil)
+        voice.playerNode.scheduleBuffer(bufferToPlay, at: nil, options: [], completionHandler: nil)
 
         // Play NOW
         voice.playerNode.play()
 
-        let duration = Double(sampleData.buffer.frameLength) / sampleData.buffer.format.sampleRate
-        print("▶️ Playing pad \(padNumber) - Voice \(nextVoiceIndex - 1) - Duration: \(duration)s")
+        print("▶️ Playing pad \(padNumber) - Voice \(nextVoiceIndex - 1) - Duration: \(actualDuration)s")
 
-        return duration
+        return actualDuration
+    }
+
+    private func applyTrimToBuffer(_ buffer: AVAudioPCMBuffer, trimStart: Float, trimEnd: Float) -> AVAudioPCMBuffer? {
+        let totalFrames = Int(buffer.frameLength)
+        let startFrame = Int(Float(totalFrames) * max(0, min(1, trimStart)))
+        let endFrame = Int(Float(totalFrames) * max(0, min(1, trimEnd)))
+        let trimmedLength = endFrame - startFrame
+
+        guard trimmedLength > 0 else { return nil }
+
+        guard let trimmedBuffer = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: AVAudioFrameCount(trimmedLength)) else {
+            return nil
+        }
+
+        trimmedBuffer.frameLength = AVAudioFrameCount(trimmedLength)
+
+        // Copy trimmed portion
+        if let srcData = buffer.floatChannelData,
+           let dstData = trimmedBuffer.floatChannelData {
+            for channel in 0..<Int(buffer.format.channelCount) {
+                let src = srcData[channel].advanced(by: startFrame)
+                let dst = dstData[channel]
+                dst.update(from: src, count: trimmedLength)
+            }
+        }
+
+        return trimmedBuffer
     }
 
     func hasRecording(padNumber: Int) -> Bool {

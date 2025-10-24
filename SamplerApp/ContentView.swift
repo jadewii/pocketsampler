@@ -429,7 +429,7 @@ struct PadSquare: View {
             if appState.recordingPad == index {
                 return Color.red
             } else if appState.playingPad == index {
-                return Color.blue
+                return Color(red: 1.0, green: 0.8, blue: 0.4)  // Lighter orange
             } else if hasRecording {
                 return Color.orange
             } else {
@@ -438,7 +438,7 @@ struct PadSquare: View {
         case .keys:
             // Keyboard mode - light pink for natural keys, dark pink for black keys
             if appState.playingPad == index {
-                return Color.blue
+                return Color(red: 1.0, green: 0.8, blue: 0.4)  // Lighter orange
             } else if isBlackKey {
                 return Color(red: 0.8, green: 0.2, blue: 0.6)  // Dark pink
             } else {
@@ -479,18 +479,9 @@ struct PadSquare: View {
             if hasRecording {
                 // Show waveform in editor when pressing
                 appState.editingPad = index
-
-                // Wait to distinguish tap from hold
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    if isPressed {
-                        // Still holding - start recording
-                        let impact = UIImpactFeedbackGenerator(style: .medium)
-                        impact.impactOccurred()
-                        startRecording()
-                    }
-                }
+                // DON'T re-record on hold - orange pads only play on tap
             } else {
-                // No recording - start recording immediately
+                // No recording - start recording immediately on white pads
                 let impact = UIImpactFeedbackGenerator(style: .medium)
                 impact.impactOccurred()
                 startRecording()
@@ -577,8 +568,12 @@ struct PadSquare: View {
             return
         }
 
-        // Try to play
-        guard let duration = audioEngine.playRecording(padNumber: index + 1) else {
+        // Try to play with current trim settings
+        guard let duration = audioEngine.playRecording(
+            padNumber: index + 1,
+            trimStart: appState.trimStart,
+            trimEnd: appState.trimEnd
+        ) else {
             print("❌ playRecording failed for pad \(index + 1)")
             return
         }
@@ -588,13 +583,14 @@ struct PadSquare: View {
         appState.editingPad = index
         appState.playbackPosition = 0.0
 
-        // Animate playback position
+        // Animate playback position (within trim range)
         let startTime = Date()
         playbackTimer?.invalidate()
         playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [self] _ in
             let elapsed = Date().timeIntervalSince(startTime)
             let progress = min(Float(elapsed / duration), 1.0)
-            appState.playbackPosition = progress
+            // Map progress to trimmed range
+            appState.playbackPosition = appState.trimStart + progress * (appState.trimEnd - appState.trimStart)
 
             if progress >= 1.0 {
                 playbackTimer?.invalidate()
@@ -666,12 +662,20 @@ struct MenuButton: View {
                 RoundedRectangle(cornerRadius: cornerRadius)
                     .fill(pastelColor)
 
-                if index == 6 {
+                if index == 5 {
+                    Text("KITS")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white)
+                } else if index == 6 {
                     Text("KEYS")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
                 } else if index == 7 {
                     Text("CLR")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white)
+                } else if index == 3 {
+                    Text("SET")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
                 }
@@ -744,9 +748,9 @@ struct MenuButton: View {
             Color(red: 1.0, green: 0.7, blue: 0.7),    // Pastel red
             Color(red: 1.0, green: 0.85, blue: 0.6),   // Pastel orange
             Color(red: 1.0, green: 1.0, blue: 0.6),    // Pastel yellow
-            Color(red: 0.7, green: 1.0, blue: 0.7),    // Pastel green
+            Color(red: 0.6, green: 0.6, blue: 0.6),    // Gray (SETTINGS)
             Color(red: 0.6, green: 0.85, blue: 1.0),   // Pastel blue
-            Color(red: 0.75, green: 0.7, blue: 1.0),   // Pastel indigo
+            Color(red: 0.75, green: 0.7, blue: 1.0),   // Pastel indigo (KITS)
             Color(red: 1.0, green: 0.7, blue: 1.0),    // Pastel violet (KEYS)
             Color(red: 0.9, green: 0.6, blue: 0.6)     // Pastel pink (CLR)
         ]
