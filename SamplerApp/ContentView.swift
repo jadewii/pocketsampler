@@ -44,7 +44,7 @@ struct ContentView: View {
 }
 
 struct WaveformEditor: View {
-    let audioEngine: InstantAudioEngine
+    @ObservedObject var audioEngine: InstantAudioEngine
     @Binding var waveformCache: [Int: (min: [Float], max: [Float])]
     @Binding var waveformCacheHiRes: [Int: (min: [Float], max: [Float])]
     @EnvironmentObject var appState: AppState
@@ -174,10 +174,20 @@ struct WaveformEditor: View {
                     }
 
                 } else if appState.recordingPad != nil {
-                    // Recording in progress but no waveform yet
-                    Text("RECORDING...")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundColor(.red)
+                    // Recording in progress - show live waveform if available
+                    if !audioEngine.liveRecordingWaveform.min.isEmpty {
+                        WaveformView(
+                            minPeaks: audioEngine.liveRecordingWaveform.min,
+                            maxPeaks: audioEngine.liveRecordingWaveform.max,
+                            color: Color.red
+                        )
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                    } else {
+                        Text("RECORDING...")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(.red)
+                    }
                 } else {
                     // No waveform - show placeholder
                     Text("Tap a pad to edit")
@@ -462,8 +472,14 @@ struct PadSquare: View {
                 }
             }
         case .keys:
-            // No text in keyboard mode
-            EmptyView()
+            // Show waveforms on pink sample selection buttons
+            if appState.keysSourcePad == nil && hasRecording {
+                if let hiResWaveform = waveformCacheHiRes[index + 1],
+                   !hiResWaveform.min.isEmpty && !hiResWaveform.max.isEmpty {
+                    LazyWaveformThumbnail(hiResSamples: hiResWaveform, color: .white)
+                        .padding(6)
+                }
+            }
         }
     }
 

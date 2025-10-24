@@ -12,10 +12,13 @@ class InstantAudioEngine: NSObject, ObservableObject {
     private var sampleBank: [Int: SampleData] = [:]  // padNumber -> decoded audio + waveform
     private let sampleBankQueue = DispatchQueue(label: "com.samplerapp.samplebank", qos: .userInitiated)
 
-    // MARK: - Recording
-    private var audioRecorder: AVAudioRecorder?
+    // MARK: - Recording (AVAudioEngine-based with live waveform)
     private var isRecording = false
     private var currentPadNumber: Int?
+    private var recordedSamples: [Float] = []  // Accumulate samples during recording
+    private var waveformUpdateTimer: Timer?
+
+    @Published var liveRecordingWaveform: (min: [Float], max: [Float]) = ([], [])
 
     // MARK: - Permanent AVAudioEngine + Voice Pool
     private let engine: AVAudioEngine
@@ -118,44 +121,46 @@ class InstantAudioEngine: NSObject, ObservableObject {
             return
         }
 
+        guard engine.isRunning else {
+            print("❌ Engine not running, cannot record")
+            return
+        }
+
         currentPadNumber = padNumber
         isRecording = true
+        recordedSamples = []
 
-        let tempURL = urlForPad(padNumber)
-
-        // Delete existing file
-        try? FileManager.default.removeItem(at: tempURL)
-
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44100.0,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
-            AVEncoderBitRateKey: 128000
-        ]
-
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            print("🎙️ Input available: \(audioSession.isInputAvailable)")
-            print("🎙️ Input channels: \(audioSession.inputNumberOfChannels)")
-
-            audioRecorder = try AVAudioRecorder(url: tempURL, settings: settings)
-            audioRecorder?.isMeteringEnabled = true
-            audioRecorder?.prepareToRecord()
-
-            let success = audioRecorder?.record() ?? false
-            print("🎤 Recording \(success ? "started" : "failed") for pad \(padNumber)")
-            print("📂 Recording to: \(tempURL.path)")
-
-            if !success {
-                isRecording = false
-            }
-
-        } catch {
-            print("❌ Failed to start recording: \(error)")
-            print("❌ Error details: \(error.localizedDescription)")
-            isRecording = false
+        // Reset live waveform
+        DispatchQueue.main.async { [weak self] in
+            self?.liveRecordingWaveform = ([], [])
         }
+
+        // Install tap on input node to capture live audio
+        let inputNode = engine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+
+        print("🎤 Starting AVAudioEngine recording for pad \(padNumber)")
+        print("   Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) channels")
+
+        // Install tap to capture PCM samples
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, time in
+            guard let self = self, self.isRecording else { return }
+
+            // Extract samples from buffer
+            guard let channelData = buffer.floatChannelData else { return }
+            let frameCount = Int(buffer.frameLength)
+            let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
+
+            // Append to recorded samples
+            self.recordedSamples.append(contentsOf: samples)
+        }
+
+        // Start timer to update live waveform every 50ms
+        waveformUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.updateLiveWaveform()
+        }
+
+        print("✅ Recording started with live waveform capture")
     }
 
     func stopRecording(completion: @escaping () -> Void) {
@@ -167,36 +172,148 @@ class InstantAudioEngine: NSObject, ObservableObject {
 
         isRecording = false
 
-        // CRITICAL: Stop and release recorder to finalize file
-        audioRecorder?.stop()
-        audioRecorder = nil  // Release so iOS flushes/finishes the file
+        // Stop timer
+        waveformUpdateTimer?.invalidate()
+        waveformUpdateTimer = nil
 
-        let fileURL = urlForPad(padNumber)
+        // Remove tap from input node
+        engine.inputNode.removeTap(onBus: 0)
 
-        // Check file was created
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            do {
-                let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-                let fileSize = attrs[.size] as? Int64 ?? 0
-                print("⏹️ Recording stopped for pad \(padNumber) - Size: \(fileSize) bytes")
+        print("⏹️ Recording stopped for pad \(padNumber)")
+        print("   Captured \(recordedSamples.count) samples (\(Float(recordedSamples.count) / 44100.0)s)")
 
-                if fileSize < 1000 {
-                    print("⚠️ Warning: Recording is very small")
-                }
-            } catch {
-                print("⚠️ Could not check recording size: \(error)")
-            }
-        } else {
-            print("❌ Warning: Recording file not found after stop")
+        // Clear live waveform
+        DispatchQueue.main.async { [weak self] in
+            self?.liveRecordingWaveform = ([], [])
         }
 
-        // Process in background
+        // Process recorded samples in background
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.processRecording(padNumber: padNumber) {
+            self?.processRecordedSamples(padNumber: padNumber) {
                 DispatchQueue.main.async {
                     completion()
                 }
             }
+        }
+    }
+
+    private func updateLiveWaveform() {
+        guard isRecording && !recordedSamples.isEmpty else { return }
+
+        // Generate waveform from current recorded samples (200 samples for display)
+        let waveform = generateWaveformFromSamples(recordedSamples, targetSamples: 200)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.liveRecordingWaveform = waveform
+        }
+    }
+
+    private func generateWaveformFromSamples(_ samples: [Float], targetSamples: Int) -> (min: [Float], max: [Float]) {
+        guard !samples.isEmpty else { return ([], []) }
+
+        let sampleCount = samples.count
+        let window = max(1, sampleCount / targetSamples)
+        var mins: [Float] = []
+        var maxs: [Float] = []
+        mins.reserveCapacity(targetSamples)
+        maxs.reserveCapacity(targetSamples)
+
+        var i = 0
+        while i < sampleCount {
+            let end = min(i + window, sampleCount)
+            var mn: Float = 1.0
+            var mx: Float = -1.0
+            var j = i
+            while j < end {
+                let v = samples[j]
+                if v < mn { mn = v }
+                if v > mx { mx = v }
+                j += 1
+            }
+            mins.append(mn)
+            maxs.append(mx)
+            i += window
+        }
+
+        return (min: mins, max: maxs)
+    }
+
+    private func processRecordedSamples(padNumber: Int, completion: @escaping () -> Void) {
+        guard !recordedSamples.isEmpty else {
+            print("❌ No samples recorded")
+            completion()
+            return
+        }
+
+        // Create AVAudioPCMBuffer from recorded samples
+        guard let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 44100,
+            channels: 1,
+            interleaved: false
+        ) else {
+            print("❌ Failed to create audio format")
+            completion()
+            return
+        }
+
+        let frameCount = recordedSamples.count
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
+            print("❌ Failed to allocate buffer")
+            completion()
+            return
+        }
+
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+
+        // Copy samples to buffer
+        if let channelData = buffer.floatChannelData {
+            channelData[0].update(from: recordedSamples, count: frameCount)
+        }
+
+        // Now process the buffer (trim, fade, normalize, store)
+        let trimmedBuffer = trimSilence(from: buffer)
+        applyFades(to: trimmedBuffer)
+        normalize(buffer: trimmedBuffer)
+
+        // Generate hi-res waveform
+        let waveformHiRes = extractWaveform(from: trimmedBuffer, samples: 200)
+
+        // Convert to AAC and save to file
+        let fileURL = urlForPad(padNumber)
+        do {
+            try convertToAAC(buffer: trimmedBuffer, outputURL: fileURL, format: monoFormat)
+            print("✅ Saved recording to: \(fileURL.path)")
+        } catch {
+            print("❌ Failed to save AAC file: \(error)")
+            completion()
+            return
+        }
+
+        // Store in sample bank
+        sampleBankQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            // Create a copy for storage
+            guard let storedBuffer = AVAudioPCMBuffer(pcmFormat: trimmedBuffer.format, frameCapacity: trimmedBuffer.frameCapacity) else {
+                print("❌ Failed to copy buffer")
+                completion()
+                return
+            }
+            storedBuffer.frameLength = trimmedBuffer.frameLength
+
+            if let srcData = trimmedBuffer.floatChannelData,
+               let dstData = storedBuffer.floatChannelData {
+                for channel in 0..<Int(trimmedBuffer.format.channelCount) {
+                    dstData[channel].update(from: srcData[channel], count: Int(trimmedBuffer.frameLength))
+                }
+            }
+
+            let sampleData = SampleData(buffer: storedBuffer, waveformHiRes: waveformHiRes)
+            self.sampleBank[padNumber] = sampleData
+
+            print("✅ Pad \(padNumber) stored in sample bank")
+            completion()
         }
     }
 
@@ -595,11 +712,24 @@ class InstantAudioEngine: NSObject, ObservableObject {
     func stopRecordingIfActive() {
         guard isRecording else { return }
 
-        print("🛑 Stopping active recording")
+        print("🛑 Stopping active recording (forced)")
         isRecording = false
-        audioRecorder?.stop()
-        audioRecorder = nil
+
+        // Stop timer
+        waveformUpdateTimer?.invalidate()
+        waveformUpdateTimer = nil
+
+        // Remove tap
+        engine.inputNode.removeTap(onBus: 0)
+
+        // Clear samples
+        recordedSamples = []
         currentPadNumber = nil
+
+        // Clear live waveform
+        DispatchQueue.main.async { [weak self] in
+            self?.liveRecordingWaveform = ([], [])
+        }
     }
 
     func clearPad(_ padNumber: Int) {
