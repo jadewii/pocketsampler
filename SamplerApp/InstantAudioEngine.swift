@@ -127,6 +127,20 @@ class InstantAudioEngine: NSObject, ObservableObject {
             return
         }
 
+        // Install tap on input node to capture live audio
+        let inputNode = engine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+
+        // Validate input format - simulator may have invalid format (0.0Hz)
+        guard inputFormat.sampleRate > 0 && inputFormat.channelCount > 0 else {
+            print("❌ Invalid input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) channels")
+            print("❌ This usually means:")
+            print("   - Running on simulator without microphone access")
+            print("   - No audio input device available")
+            print("   - Try running on a real device")
+            return
+        }
+
         currentPadNumber = padNumber
         isRecording = true
         recordedSamples = []
@@ -135,10 +149,6 @@ class InstantAudioEngine: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.liveRecordingWaveform = ([], [])
         }
-
-        // Install tap on input node to capture live audio
-        let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
 
         // Store the actual input sample rate so we can create buffers correctly
         recordingSampleRate = inputFormat.sampleRate
@@ -180,11 +190,13 @@ class InstantAudioEngine: NSObject, ObservableObject {
         waveformUpdateTimer?.invalidate()
         waveformUpdateTimer = nil
 
-        // Remove tap from input node
-        engine.inputNode.removeTap(onBus: 0)
+        // Remove tap from input node (wrapped in safety check)
+        if engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+        }
 
         print("⏹️ Recording stopped for pad \(padNumber)")
-        print("   Captured \(recordedSamples.count) samples (\(Float(recordedSamples.count) / 44100.0)s)")
+        print("   Captured \(recordedSamples.count) samples (\(Double(recordedSamples.count) / recordingSampleRate)s)")
 
         // Clear live waveform
         DispatchQueue.main.async { [weak self] in
@@ -310,7 +322,7 @@ class InstantAudioEngine: NSObject, ObservableObject {
             }
 
             var error: NSError?
-            var inputBufferCopy = inputBuffer // Keep reference
+            let inputBufferCopy = inputBuffer // Keep reference
 
             converter.convert(to: outputBuffer, error: &error) { inNumPackets, outStatus in
                 outStatus.pointee = .haveData
@@ -778,8 +790,10 @@ class InstantAudioEngine: NSObject, ObservableObject {
         waveformUpdateTimer?.invalidate()
         waveformUpdateTimer = nil
 
-        // Remove tap
-        engine.inputNode.removeTap(onBus: 0)
+        // Remove tap (wrapped in safety check)
+        if engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+        }
 
         // Clear samples
         recordedSamples = []
