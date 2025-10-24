@@ -321,7 +321,6 @@ struct GridView: View {
             .position(x: offsetX + gridW/2, y: offsetY + gridH/2)
             .transaction { $0.animation = nil }
         }
-        .background(Color.black)
     }
 }
 
@@ -437,22 +436,13 @@ struct PadSquare: View {
                 return Color.white
             }
         case .keys:
-            // Sample selection mode - show recorded pads as pink
-            if appState.keysSourcePad == nil {
-                if hasRecording {
-                    return Color(red: 1.0, green: 0.7, blue: 1.0)  // Pink for recorded pads
-                } else {
-                    return Color.white
-                }
+            // Keyboard mode - light pink for natural keys, dark pink for black keys
+            if appState.playingPad == index {
+                return Color.blue
+            } else if isBlackKey {
+                return Color(red: 0.8, green: 0.2, blue: 0.6)  // Dark pink
             } else {
-                // Keyboard mode - white for natural keys, dark pink for black keys
-                if appState.playingPad == index {
-                    return Color.blue
-                } else if isBlackKey {
-                    return Color(red: 0.8, green: 0.2, blue: 0.6)  // Dark pink
-                } else {
-                    return Color.white
-                }
+                return Color(red: 1.0, green: 0.7, blue: 1.0)  // Light pink (like KEYS button)
             }
         }
     }
@@ -474,14 +464,8 @@ struct PadSquare: View {
                 }
             }
         case .keys:
-            // Show waveforms on pink sample selection buttons
-            if appState.keysSourcePad == nil && hasRecording {
-                if let hiResWaveform = waveformCacheHiRes[index + 1],
-                   !hiResWaveform.min.isEmpty && !hiResWaveform.max.isEmpty {
-                    LazyWaveformThumbnail(hiResSamples: hiResWaveform, color: .white)
-                        .padding(6)
-                }
-            }
+            // No overlays in keyboard mode
+            EmptyView()
         }
     }
 
@@ -513,17 +497,9 @@ struct PadSquare: View {
             }
 
         case .keys:
-            if appState.keysSourcePad == nil {
-                // No source selected yet - select this pad if it has audio
-                if hasRecording {
-                    appState.keysSourcePad = index + 1  // Store padNumber for audio engine
-                    let impact = UIImpactFeedbackGenerator(style: .medium)
-                    impact.impactOccurred()
-                }
-            } else {
-                // Play note
-                playNote()
-            }
+            // Always play note in keyboard mode
+            playNote()
+
         }
     }
 
@@ -711,8 +687,23 @@ struct MenuButton: View {
                 appState.mode = .pads
                 appState.keysSourcePad = nil
             } else {
-                // Enter keyboard mode
+                // Enter keyboard mode - use editing pad or find first recording
                 appState.mode = .keys
+
+                // Try to use the currently edited pad (red outline)
+                if let editingPad = appState.editingPad,
+                   audioEngine.hasRecording(padNumber: editingPad + 1) {
+                    appState.keysSourcePad = editingPad + 1
+                } else {
+                    // Find first available recording
+                    for padNumber in 1...(11 * 8) {
+                        if audioEngine.hasRecording(padNumber: padNumber) {
+                            appState.keysSourcePad = padNumber
+                            appState.editingPad = padNumber - 1  // Set red outline
+                            break
+                        }
+                    }
+                }
             }
         case 7: // CLEAR button
             if appState.mode == .pads {

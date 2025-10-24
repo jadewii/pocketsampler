@@ -115,6 +115,10 @@ class InstantAudioEngine: NSObject, ObservableObject {
         getDocumentsDirectory().appendingPathComponent("pad_\(padNumber).m4a")
     }
 
+    func tempWavUrlForPad(_ padNumber: Int) -> URL {
+        getDocumentsDirectory().appendingPathComponent("pad_\(padNumber)_temp.wav")
+    }
+
     func startRecording(padNumber: Int) {
         guard !isRecording else {
             print("⚠️ Already recording")
@@ -124,17 +128,20 @@ class InstantAudioEngine: NSObject, ObservableObject {
         currentPadNumber = padNumber
         isRecording = true
 
-        let tempURL = urlForPad(padNumber)
+        // Record to WAV temporarily (can be read while recording for live waveform)
+        let tempURL = tempWavUrlForPad(padNumber)
 
-        // Delete existing file
+        // Delete existing temp file
         try? FileManager.default.removeItem(at: tempURL)
 
+        // PCM/WAV settings (uncompressed, can read while recording)
         let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 44100.0,
             AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
-            AVEncoderBitRateKey: 128000
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false
         ]
 
         do {
@@ -189,12 +196,12 @@ class InstantAudioEngine: NSObject, ObservableObject {
         audioRecorder?.stop()
         audioRecorder = nil  // Release so iOS flushes/finishes the file
 
-        let fileURL = urlForPad(padNumber)
+        let tempWavURL = tempWavUrlForPad(padNumber)
 
-        // Check file was created
-        if FileManager.default.fileExists(atPath: fileURL.path) {
+        // Check temp WAV file was created
+        if FileManager.default.fileExists(atPath: tempWavURL.path) {
             do {
-                let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+                let attrs = try FileManager.default.attributesOfItem(atPath: tempWavURL.path)
                 let fileSize = attrs[.size] as? Int64 ?? 0
                 print("⏹️ Recording stopped for pad \(padNumber) - Size: \(fileSize) bytes")
 
@@ -205,7 +212,7 @@ class InstantAudioEngine: NSObject, ObservableObject {
                 print("⚠️ Could not check recording size: \(error)")
             }
         } else {
-            print("❌ Warning: Recording file not found after stop")
+            print("❌ Warning: Temp WAV file not found after stop")
         }
 
         // Clear live waveform
@@ -226,41 +233,63 @@ class InstantAudioEngine: NSObject, ObservableObject {
     private func updateLiveWaveformFromFile() {
         guard isRecording, let padNumber = currentPadNumber else { return }
 
-        let fileURL = urlForPad(padNumber)
+        let tempWavURL = tempWavUrlForPad(padNumber)
 
-        // Try to read the file being recorded
+        // Try to read the temp WAV file being recorded
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            // Generate waveform from current file (may be incomplete)
-            let waveform = self.getWaveformData(padNumber: padNumber, samples: 200)
+            // Check if file exists and has content
+            guard FileManager.default.fileExists(atPath: tempWavURL.path) else {
+                return
+            }
 
-            // Update live waveform on main thread
-            DispatchQueue.main.async {
-                if self.isRecording && self.currentPadNumber == padNumber {
-                    self.liveRecordingWaveform = waveform
+            // Try to read and generate waveform from WAV file (readable while recording)
+            do {
+                let audioFile = try AVAudioFile(forReading: tempWavURL)
+                let format = audioFile.processingFormat
+                let frameCount = UInt32(audioFile.length)
+
+                guard frameCount > 0 else { return }
+
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                    return
                 }
+
+                try audioFile.read(into: buffer)
+                let waveform = self.extractWaveform(from: buffer, samples: 200)
+
+                // Update live waveform on main thread
+                DispatchQueue.main.async {
+                    if self.isRecording && self.currentPadNumber == padNumber {
+                        self.liveRecordingWaveform = waveform
+                    }
+                }
+            } catch {
+                // File not ready yet or still being written, ignore error
             }
         }
     }
 
     private func processRecording(padNumber: Int, completion: @escaping () -> Void) {
-        let fileURL = urlForPad(padNumber)
+        let tempWavURL = tempWavUrlForPad(padNumber)
+        let finalM4aURL = urlForPad(padNumber)
 
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            print("❌ processRecording: File doesn't exist at \(fileURL.path)")
+        guard FileManager.default.fileExists(atPath: tempWavURL.path) else {
+            print("❌ processRecording: Temp WAV file doesn't exist at \(tempWavURL.path)")
             completion()
             return
         }
 
         do {
-            let audioFile = try AVAudioFile(forReading: fileURL)
+            // Read the temp WAV file
+            let audioFile = try AVAudioFile(forReading: tempWavURL)
             let format = audioFile.processingFormat
             let frameCount = UInt32(audioFile.length)
 
             guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
-                print("❌ Failed to allocate buffer for pad \(padNumber), deleting file")
-                try? FileManager.default.removeItem(at: fileURL)
+                print("❌ Failed to allocate buffer for pad \(padNumber), deleting temp file")
+                try? FileManager.default.removeItem(at: tempWavURL)
                 completion()
                 return
             }
@@ -277,14 +306,28 @@ class InstantAudioEngine: NSObject, ObservableObject {
             // Generate hi-res waveform from trimmed buffer (200 samples for editor)
             let waveformHiRes = extractWaveform(from: trimmedBuffer, samples: 200)
 
+            // Convert to AAC and save to final .m4a file
+            do {
+                try convertToAAC(buffer: trimmedBuffer, outputURL: finalM4aURL, format: format)
+                print("✅ Converted to AAC and saved to: \(finalM4aURL.path)")
+            } catch {
+                print("❌ Failed to convert to AAC: \(error)")
+                try? FileManager.default.removeItem(at: tempWavURL)
+                completion()
+                return
+            }
+
+            // Delete temp WAV file
+            try? FileManager.default.removeItem(at: tempWavURL)
+            print("🗑️ Deleted temp WAV file")
+
             // Store in sample bank (ALL HEAVY WORK DONE NOW, NOT ON PLAYBACK)
             sampleBankQueue.async { [weak self] in
                 guard let self = self else { return }
 
                 // Create a copy of the buffer for storage
                 guard let storedBuffer = AVAudioPCMBuffer(pcmFormat: trimmedBuffer.format, frameCapacity: trimmedBuffer.frameCapacity) else {
-                    print("❌ Failed to copy buffer for pad \(padNumber), deleting file")
-                    try? FileManager.default.removeItem(at: fileURL)
+                    print("❌ Failed to copy buffer for pad \(padNumber)")
                     completion()
                     return
                 }
@@ -310,8 +353,8 @@ class InstantAudioEngine: NSObject, ObservableObject {
 
         } catch {
             print("❌ Failed to process recording for pad \(padNumber): \(error)")
-            print("   Deleting corrupt file")
-            try? FileManager.default.removeItem(at: fileURL)
+            print("   Deleting corrupt temp file")
+            try? FileManager.default.removeItem(at: tempWavURL)
             completion()
         }
     }
@@ -321,14 +364,14 @@ class InstantAudioEngine: NSObject, ObservableObject {
 
         let frameCount = Int(buffer.frameLength)
         let data = channelData[0]
-        let threshold: Float = 0.02  // Silence threshold (adjust as needed)
+        let threshold: Float = 0.005  // More aggressive silence threshold
 
         // Find first sample above threshold
         var startFrame = 0
         for i in 0..<frameCount {
             if abs(data[i]) > threshold {
-                // Include a small pre-roll (50ms at 44.1kHz = ~2200 samples)
-                startFrame = max(0, i - 2200)
+                // Include minimal pre-roll (2ms at 44.1kHz = ~88 samples)
+                startFrame = max(0, i - 88)
                 break
             }
         }
