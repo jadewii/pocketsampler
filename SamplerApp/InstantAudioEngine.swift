@@ -126,9 +126,16 @@ class InstantAudioEngine: NSObject, ObservableObject {
             return
         }
 
-        guard engine.isRunning else {
-            print("❌ Cannot start recording: engine not running")
-            return
+        // Check engine state and try to restart if needed
+        if !engine.isRunning {
+            print("⚠️ Engine not running when starting recording, attempting to restart...")
+            do {
+                try engine.start()
+                print("✅ Engine restarted successfully")
+            } catch {
+                print("❌ Cannot start recording: engine failed to start - \(error)")
+                return
+            }
         }
 
         currentPadNumber = padNumber
@@ -159,9 +166,6 @@ class InstantAudioEngine: NSObject, ObservableObject {
             accumulatedBuffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: 44100 * 10) // 10 seconds max
             accumulatedBuffer?.frameLength = 0
 
-            print("🎤 Recording started for pad \(padNumber)")
-            print("📂 Recording to: \(tempURL.path)")
-
             // Reset live waveform
             DispatchQueue.main.async { [weak self] in
                 self?.liveRecordingWaveform = ([], [])
@@ -171,6 +175,7 @@ class InstantAudioEngine: NSObject, ObservableObject {
 
             // Install tap on input node to capture audio buffers
             // Pass nil for format to use the node's natural format
+            print("🎤 Installing tap on input node...")
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, time in
                 guard let self = self, self.isRecording else { return }
 
@@ -182,11 +187,26 @@ class InstantAudioEngine: NSObject, ObservableObject {
                 }
             }
 
+            print("✅ Recording started for pad \(padNumber)")
+            print("📂 Recording to: \(tempURL.path)")
+
         } catch {
             print("❌ Failed to start recording: \(error)")
+            print("❌ Error details: \(error.localizedDescription)")
             isRecording = false
             recordingFileWriter = nil
             accumulatedBuffer = nil
+
+            // Try to restart engine if it stopped
+            if !engine.isRunning {
+                print("⚠️ Engine stopped, attempting to restart...")
+                do {
+                    try engine.start()
+                    print("✅ Engine restarted after error")
+                } catch {
+                    print("❌ Failed to restart engine: \(error)")
+                }
+            }
         }
     }
 
