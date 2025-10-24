@@ -137,11 +137,8 @@ class InstantAudioEngine: NSObject, ObservableObject {
         // Delete existing temp file
         try? FileManager.default.removeItem(at: tempURL)
 
-        // Get input node and its format
+        // Get input node
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-
-        print("🎙️ Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) channels")
 
         // Create our target mono format (44.1kHz mono to match playback)
         guard let recordingFormat = AVAudioFormat(
@@ -173,8 +170,12 @@ class InstantAudioEngine: NSObject, ObservableObject {
             isRecording = true
 
             // Install tap on input node to capture audio buffers
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, time in
+            // Pass nil for format to use the node's natural format
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, time in
                 guard let self = self, self.isRecording else { return }
+
+                // Get the actual input format from the buffer
+                let inputFormat = buffer.format
 
                 self.recordingQueue.async {
                     self.handleRecordingBuffer(buffer, originalFormat: inputFormat, targetFormat: recordingFormat)
