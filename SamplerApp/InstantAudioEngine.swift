@@ -12,11 +12,12 @@ class InstantAudioEngine: NSObject, ObservableObject {
     private var sampleBank: [Int: SampleData] = [:]  // padNumber -> decoded audio + waveform
     private let sampleBankQueue = DispatchQueue(label: "com.samplerapp.samplebank", qos: .userInitiated)
 
-    // MARK: - Recording (AVAudioRecorder with live waveform polling)
-    private var audioRecorder: AVAudioRecorder?
+    // MARK: - Recording (AVAudioEngine input tap for live waveform)
     private var isRecording = false
     private var currentPadNumber: Int?
-    private var waveformUpdateTimer: Timer?
+    private var recordingFileWriter: AVAudioFile?
+    private var accumulatedBuffer: AVAudioPCMBuffer?
+    private let recordingQueue = DispatchQueue(label: "com.samplerapp.recording", qos: .userInitiated)
 
     @Published var liveRecordingWaveform: (min: [Float], max: [Float]) = ([], [])
 
@@ -125,58 +126,155 @@ class InstantAudioEngine: NSObject, ObservableObject {
             return
         }
 
-        currentPadNumber = padNumber
-        isRecording = true
+        guard engine.isRunning else {
+            print("❌ Cannot start recording: engine not running")
+            return
+        }
 
-        // Record to WAV temporarily (can be read while recording for live waveform)
+        currentPadNumber = padNumber
         let tempURL = tempWavUrlForPad(padNumber)
 
         // Delete existing temp file
         try? FileManager.default.removeItem(at: tempURL)
 
-        // PCM/WAV settings (uncompressed, can read while recording)
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatLinearPCM),
-            AVSampleRateKey: 44100.0,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false
-        ]
+        // Get input node and its format
+        let inputNode = engine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+
+        print("🎙️ Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) channels")
+
+        // Create our target mono format (44.1kHz mono to match playback)
+        guard let recordingFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 44100,
+            channels: 1,
+            interleaved: false
+        ) else {
+            print("❌ Failed to create recording format")
+            return
+        }
 
         do {
-            let audioSession = AVAudioSession.sharedInstance()
-            print("🎙️ Input available: \(audioSession.isInputAvailable)")
-            print("🎙️ Input channels: \(audioSession.inputNumberOfChannels)")
+            // Create WAV file writer
+            recordingFileWriter = try AVAudioFile(forWriting: tempURL, settings: recordingFormat.settings)
 
-            audioRecorder = try AVAudioRecorder(url: tempURL, settings: settings)
-            audioRecorder?.isMeteringEnabled = true
-            audioRecorder?.prepareToRecord()
+            // Create accumulation buffer (start small, grow as needed)
+            accumulatedBuffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: 44100 * 10) // 10 seconds max
+            accumulatedBuffer?.frameLength = 0
 
-            let success = audioRecorder?.record() ?? false
-            print("🎤 Recording \(success ? "started" : "failed") for pad \(padNumber)")
+            print("🎤 Recording started for pad \(padNumber)")
             print("📂 Recording to: \(tempURL.path)")
-
-            if !success {
-                isRecording = false
-                return
-            }
 
             // Reset live waveform
             DispatchQueue.main.async { [weak self] in
                 self?.liveRecordingWaveform = ([], [])
             }
 
-            // Start timer to update live waveform by reading file every 100ms
-            waveformUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-                self?.updateLiveWaveformFromFile()
+            isRecording = true
+
+            // Install tap on input node to capture audio buffers
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, time in
+                guard let self = self, self.isRecording else { return }
+
+                self.recordingQueue.async {
+                    self.handleRecordingBuffer(buffer, originalFormat: inputFormat, targetFormat: recordingFormat)
+                }
             }
 
         } catch {
             print("❌ Failed to start recording: \(error)")
-            print("❌ Error details: \(error.localizedDescription)")
             isRecording = false
+            recordingFileWriter = nil
+            accumulatedBuffer = nil
         }
+    }
+
+    private func handleRecordingBuffer(_ buffer: AVAudioPCMBuffer, originalFormat: AVAudioFormat, targetFormat: AVAudioFormat) {
+        // Convert buffer to target format if needed (e.g., 48kHz stereo -> 44.1kHz mono)
+        guard let convertedBuffer = convertBuffer(buffer, from: originalFormat, to: targetFormat) else {
+            print("⚠️ Failed to convert recording buffer")
+            return
+        }
+
+        // Write to file
+        do {
+            try recordingFileWriter?.write(from: convertedBuffer)
+        } catch {
+            print("❌ Failed to write recording buffer: \(error)")
+        }
+
+        // Accumulate buffer for live waveform
+        guard let accumulated = accumulatedBuffer,
+              let convertedData = convertedBuffer.floatChannelData,
+              let accumulatedData = accumulated.floatChannelData else {
+            return
+        }
+
+        let framesToCopy = Int(convertedBuffer.frameLength)
+        let currentFrames = Int(accumulated.frameLength)
+        let newTotalFrames = currentFrames + framesToCopy
+
+        // Make sure we don't overflow
+        guard newTotalFrames <= accumulated.frameCapacity else {
+            print("⚠️ Recording buffer full, stopping accumulation")
+            return
+        }
+
+        // Append new audio data
+        for channel in 0..<Int(targetFormat.channelCount) {
+            let src = convertedData[channel]
+            let dst = accumulatedData[channel].advanced(by: currentFrames)
+            dst.update(from: src, count: framesToCopy)
+        }
+
+        accumulated.frameLength = AVAudioFrameCount(newTotalFrames)
+
+        // Update live waveform every ~0.1 seconds worth of audio
+        if framesToCopy > 0 {
+            let waveform = extractWaveform(from: accumulated, samples: 200)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.isRecording else { return }
+                self.liveRecordingWaveform = waveform
+            }
+        }
+    }
+
+    private func convertBuffer(_ buffer: AVAudioPCMBuffer, from sourceFormat: AVAudioFormat, to targetFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+        // If formats match, just return the buffer
+        if sourceFormat == targetFormat {
+            return buffer
+        }
+
+        // Create converter
+        guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            print("❌ Failed to create audio converter")
+            return nil
+        }
+
+        // Calculate output frame count (handle sample rate conversion)
+        let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+        let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+
+        guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCount) else {
+            print("❌ Failed to create converted buffer")
+            return nil
+        }
+
+        var error: NSError?
+        let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+            outStatus.pointee = .haveData
+            return buffer
+        }
+
+        converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
+
+        if let error = error {
+            print("❌ Conversion error: \(error)")
+            return nil
+        }
+
+        return convertedBuffer
     }
 
     func stopRecording(completion: @escaping () -> Void) {
@@ -188,13 +286,11 @@ class InstantAudioEngine: NSObject, ObservableObject {
 
         isRecording = false
 
-        // Stop timer
-        waveformUpdateTimer?.invalidate()
-        waveformUpdateTimer = nil
+        // Remove tap from input node
+        engine.inputNode.removeTap(onBus: 0)
 
-        // CRITICAL: Stop and release recorder to finalize file
-        audioRecorder?.stop()
-        audioRecorder = nil  // Release so iOS flushes/finishes the file
+        // Close file writer
+        recordingFileWriter = nil
 
         let tempWavURL = tempWavUrlForPad(padNumber)
 
@@ -230,67 +326,6 @@ class InstantAudioEngine: NSObject, ObservableObject {
         }
     }
 
-    private func updateLiveWaveformFromFile() {
-        guard isRecording, let padNumber = currentPadNumber else { return }
-
-        let tempWavURL = tempWavUrlForPad(padNumber)
-
-        // Try to read the temp WAV file being recorded
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-
-            // Check if file exists and has content
-            guard FileManager.default.fileExists(atPath: tempWavURL.path) else {
-                print("⏳ Live waveform: WAV file doesn't exist yet")
-                return
-            }
-
-            // Check file size
-            do {
-                let attrs = try FileManager.default.attributesOfItem(atPath: tempWavURL.path)
-                let fileSize = attrs[.size] as? Int64 ?? 0
-                print("📊 Live waveform: WAV file size: \(fileSize) bytes")
-            } catch {
-                print("⚠️ Live waveform: Can't read file size: \(error)")
-            }
-
-            // Try to read and generate waveform from WAV file (readable while recording)
-            do {
-                let audioFile = try AVAudioFile(forReading: tempWavURL)
-                let format = audioFile.processingFormat
-                let frameCount = UInt32(audioFile.length)
-
-                print("📈 Live waveform: Reading WAV - \(frameCount) frames")
-
-                guard frameCount > 0 else {
-                    print("⚠️ Live waveform: No frames in file yet")
-                    return
-                }
-
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
-                    print("❌ Live waveform: Failed to allocate buffer")
-                    return
-                }
-
-                try audioFile.read(into: buffer)
-                let waveform = self.extractWaveform(from: buffer, samples: 200)
-
-                print("✅ Live waveform: Generated waveform with \(waveform.min.count) samples")
-
-                // Update live waveform on main thread
-                DispatchQueue.main.async {
-                    if self.isRecording && self.currentPadNumber == padNumber {
-                        self.liveRecordingWaveform = waveform
-                        print("🎨 Live waveform: Updated UI")
-                    } else {
-                        print("⚠️ Live waveform: Recording stopped, discarding update")
-                    }
-                }
-            } catch {
-                print("❌ Live waveform: Failed to read WAV: \(error)")
-            }
-        }
-    }
 
     private func processRecording(padNumber: Int, completion: @escaping () -> Void) {
         let tempWavURL = tempWavUrlForPad(padNumber)
@@ -751,13 +786,14 @@ class InstantAudioEngine: NSObject, ObservableObject {
         print("🛑 Stopping active recording (forced)")
         isRecording = false
 
-        // Stop timer
-        waveformUpdateTimer?.invalidate()
-        waveformUpdateTimer = nil
+        // Remove tap from input node
+        if engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+        }
 
-        // Stop and release recorder
-        audioRecorder?.stop()
-        audioRecorder = nil
+        // Close file writer
+        recordingFileWriter = nil
+        accumulatedBuffer = nil
 
         currentPadNumber = nil
 
