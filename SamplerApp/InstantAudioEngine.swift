@@ -16,6 +16,7 @@ class InstantAudioEngine: NSObject, ObservableObject {
     private var isRecording = false
     private var currentPadNumber: Int?
     private var recordedSamples: [Float] = []  // Accumulate samples during recording
+    private var recordingSampleRate: Double = 44100.0  // Track actual input sample rate
     private var waveformUpdateTimer: Timer?
 
     @Published var liveRecordingWaveform: (min: [Float], max: [Float]) = ([], [])
@@ -139,14 +140,17 @@ class InstantAudioEngine: NSObject, ObservableObject {
         let inputNode = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
+        // Store the actual input sample rate so we can create buffers correctly
+        recordingSampleRate = inputFormat.sampleRate
+
         print("🎤 Starting AVAudioEngine recording for pad \(padNumber)")
         print("   Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) channels")
 
-        // Install tap to capture PCM samples
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, time in
+        // Install tap to capture PCM samples (use nil format to get native format)
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, time in
             guard let self = self, self.isRecording else { return }
 
-            // Extract samples from buffer
+            // Extract samples from buffer (always use first channel for mono)
             guard let channelData = buffer.floatChannelData else { return }
             let frameCount = Int(buffer.frameLength)
             let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
@@ -245,34 +249,89 @@ class InstantAudioEngine: NSObject, ObservableObject {
             return
         }
 
-        // Create AVAudioPCMBuffer from recorded samples
-        guard let monoFormat = AVAudioFormat(
+        // Create buffer with the ACTUAL recording sample rate (not 44.1kHz)
+        guard let inputFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
-            sampleRate: 44100,
+            sampleRate: recordingSampleRate,
             channels: 1,
             interleaved: false
         ) else {
-            print("❌ Failed to create audio format")
+            print("❌ Failed to create input format at \(recordingSampleRate)Hz")
             completion()
             return
         }
 
         let frameCount = recordedSamples.count
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
-            print("❌ Failed to allocate buffer")
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
+            print("❌ Failed to allocate input buffer")
             completion()
             return
         }
 
-        buffer.frameLength = AVAudioFrameCount(frameCount)
+        inputBuffer.frameLength = AVAudioFrameCount(frameCount)
 
-        // Copy samples to buffer
-        if let channelData = buffer.floatChannelData {
+        // Copy samples to input buffer
+        if let channelData = inputBuffer.floatChannelData {
             channelData[0].update(from: recordedSamples, count: frameCount)
         }
 
+        print("📼 Processing \(frameCount) samples at \(recordingSampleRate)Hz")
+
+        // Resample to 44.1kHz mono if needed
+        let targetSampleRate: Double = 44100.0
+        let finalBuffer: AVAudioPCMBuffer
+
+        if recordingSampleRate != targetSampleRate {
+            print("🔄 Resampling from \(recordingSampleRate)Hz to \(targetSampleRate)Hz")
+
+            guard let outputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: targetSampleRate,
+                channels: 1,
+                interleaved: false
+            ) else {
+                print("❌ Failed to create output format")
+                completion()
+                return
+            }
+
+            guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+                print("❌ Failed to create converter")
+                completion()
+                return
+            }
+
+            // Calculate output frame count
+            let outputFrameCount = AVAudioFrameCount(Double(frameCount) * targetSampleRate / recordingSampleRate)
+            guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputFrameCount + 1024) else {
+                print("❌ Failed to allocate output buffer")
+                completion()
+                return
+            }
+
+            var error: NSError?
+            var inputBufferCopy = inputBuffer // Keep reference
+
+            converter.convert(to: outputBuffer, error: &error) { inNumPackets, outStatus in
+                outStatus.pointee = .haveData
+                return inputBufferCopy
+            }
+
+            if let error = error {
+                print("❌ Conversion failed: \(error)")
+                completion()
+                return
+            }
+
+            finalBuffer = outputBuffer
+            print("✅ Resampled to \(outputBuffer.frameLength) frames at 44.1kHz")
+        } else {
+            finalBuffer = inputBuffer
+            print("✓ Already at 44.1kHz, no resampling needed")
+        }
+
         // Now process the buffer (trim, fade, normalize, store)
-        let trimmedBuffer = trimSilence(from: buffer)
+        let trimmedBuffer = trimSilence(from: finalBuffer)
         applyFades(to: trimmedBuffer)
         normalize(buffer: trimmedBuffer)
 
@@ -282,7 +341,7 @@ class InstantAudioEngine: NSObject, ObservableObject {
         // Convert to AAC and save to file
         let fileURL = urlForPad(padNumber)
         do {
-            try convertToAAC(buffer: trimmedBuffer, outputURL: fileURL, format: monoFormat)
+            try convertToAAC(buffer: trimmedBuffer, outputURL: fileURL, format: trimmedBuffer.format)
             print("✅ Saved recording to: \(fileURL.path)")
         } catch {
             print("❌ Failed to save AAC file: \(error)")
