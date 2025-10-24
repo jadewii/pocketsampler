@@ -241,7 +241,17 @@ class InstantAudioEngine: NSObject, ObservableObject {
 
             // Check if file exists and has content
             guard FileManager.default.fileExists(atPath: tempWavURL.path) else {
+                print("⏳ Live waveform: WAV file doesn't exist yet")
                 return
+            }
+
+            // Check file size
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: tempWavURL.path)
+                let fileSize = attrs[.size] as? Int64 ?? 0
+                print("📊 Live waveform: WAV file size: \(fileSize) bytes")
+            } catch {
+                print("⚠️ Live waveform: Can't read file size: \(error)")
             }
 
             // Try to read and generate waveform from WAV file (readable while recording)
@@ -250,23 +260,34 @@ class InstantAudioEngine: NSObject, ObservableObject {
                 let format = audioFile.processingFormat
                 let frameCount = UInt32(audioFile.length)
 
-                guard frameCount > 0 else { return }
+                print("📈 Live waveform: Reading WAV - \(frameCount) frames")
+
+                guard frameCount > 0 else {
+                    print("⚠️ Live waveform: No frames in file yet")
+                    return
+                }
 
                 guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                    print("❌ Live waveform: Failed to allocate buffer")
                     return
                 }
 
                 try audioFile.read(into: buffer)
                 let waveform = self.extractWaveform(from: buffer, samples: 200)
 
+                print("✅ Live waveform: Generated waveform with \(waveform.min.count) samples")
+
                 // Update live waveform on main thread
                 DispatchQueue.main.async {
                     if self.isRecording && self.currentPadNumber == padNumber {
                         self.liveRecordingWaveform = waveform
+                        print("🎨 Live waveform: Updated UI")
+                    } else {
+                        print("⚠️ Live waveform: Recording stopped, discarding update")
                     }
                 }
             } catch {
-                // File not ready yet or still being written, ignore error
+                print("❌ Live waveform: Failed to read WAV: \(error)")
             }
         }
     }
