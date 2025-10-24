@@ -176,8 +176,14 @@ class InstantAudioEngine: NSObject, ObservableObject {
             // Install tap on input node to capture audio buffers
             // Pass nil for format to use the node's natural format
             print("🎤 Installing tap on input node...")
+            var bufferCount = 0
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, time in
                 guard let self = self, self.isRecording else { return }
+
+                bufferCount += 1
+                if bufferCount == 1 {
+                    print("🎧 First audio buffer received! Format: \(buffer.format.sampleRate)Hz, \(buffer.format.channelCount)ch, \(buffer.frameLength) frames")
+                }
 
                 // Get the actual input format from the buffer
                 let inputFormat = buffer.format
@@ -217,9 +223,12 @@ class InstantAudioEngine: NSObject, ObservableObject {
             return
         }
 
+        print("📝 Processing buffer: \(convertedBuffer.frameLength) frames")
+
         // Write to file
         do {
             try recordingFileWriter?.write(from: convertedBuffer)
+            print("✍️ Wrote \(convertedBuffer.frameLength) frames to file")
         } catch {
             print("❌ Failed to write recording buffer: \(error)")
         }
