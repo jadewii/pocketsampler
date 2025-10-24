@@ -7,39 +7,41 @@ struct ContentView: View {
     @State private var waveformCacheHiRes: [Int: (min: [Float], max: [Float])] = [:]  // High-res for editor
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Top context bar
-            TopBar()
+        ZStack {
+            // Background that covers entire screen
+            backgroundColor
+                .ignoresSafeArea(.all)
+                .animation(.easeInOut(duration: 0.2), value: appState.recordingPad)
+
+            VStack(spacing: 0) {
+                // Top context bar
+                TopBar()
+                    .environmentObject(appState)
+                    .frame(height: 44)
+
+                // Waveform editor
+                WaveformEditor(
+                    audioEngine: audioEngine,
+                    waveformCache: $waveformCache,
+                    waveformCacheHiRes: $waveformCacheHiRes
+                )
                 .environmentObject(appState)
-                .frame(height: 44)
-                .background(Color.black)
+                .frame(height: 90)
 
-            // Waveform editor
-            WaveformEditor(
-                audioEngine: audioEngine,
-                waveformCache: $waveformCache,
-                waveformCacheHiRes: $waveformCacheHiRes
-            )
-            .environmentObject(appState)
-            .frame(height: 90)
-            .background(Color.black)
-
-            // Main grid - includes menu buttons as last row
-            GridView(
-                audioEngine: audioEngine,
-                waveformCache: $waveformCache,
-                waveformCacheHiRes: $waveformCacheHiRes
-            )
-            .environmentObject(appState)
-            .background(backgroundColor)
-            .animation(.easeInOut(duration: 0.15), value: appState.recordingPad)
+                // Main grid - includes menu buttons as last row
+                GridView(
+                    audioEngine: audioEngine,
+                    waveformCache: $waveformCache,
+                    waveformCacheHiRes: $waveformCacheHiRes
+                )
+                .environmentObject(appState)
+            }
         }
-        .background(Color.black)
-        .ignoresSafeArea(.all, edges: .bottom)
     }
 
     var backgroundColor: Color {
-        appState.recordingPad != nil ? Color(red: 0.4, green: 0.0, blue: 0.0) : Color.black
+        // Visible dark red when recording (entire screen)
+        appState.recordingPad != nil ? Color(red: 0.25, green: 0.0, blue: 0.0) : Color.black
     }
 }
 
