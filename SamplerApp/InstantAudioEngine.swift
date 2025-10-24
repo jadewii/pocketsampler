@@ -193,6 +193,12 @@ class InstantAudioEngine: NSObject, ObservableObject {
                 }
             }
 
+            // CRITICAL: Must restart engine after installing tap for it to take effect
+            print("🔄 Restarting engine to activate tap...")
+            engine.stop()
+            try engine.start()
+            print("✅ Engine restarted with tap active")
+
             print("✅ Recording started for pad \(padNumber)")
             print("📂 Recording to: \(tempURL.path)")
 
